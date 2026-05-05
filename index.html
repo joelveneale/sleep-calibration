@@ -1,0 +1,1201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sleep Calibration Dashboard</title>
+  <style>body { margin: 0; padding: 0; background: #0c0c10; }</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script type="text/babel">
+    // localStorage shim matching window.storage API
+    window.storage = {
+      async get(key) {
+        const val = localStorage.getItem("sc:" + key);
+        if (val === null) throw new Error("Key not found");
+        return { key, value: val };
+      },
+      async set(key, value) {
+        localStorage.setItem("sc:" + key, value);
+        return { key, value };
+      },
+      async delete(key) {
+        localStorage.removeItem("sc:" + key);
+        return { key, deleted: true };
+      },
+      async list(prefix) {
+        const keys = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k.startsWith("sc:" + (prefix || ""))) {
+            keys.push(k.slice(3));
+          }
+        }
+        return { keys };
+      }
+    };
+  </script>
+  <script type="text/babel">
+const { useState, useCallback, useEffect } = React;
+const {
+  LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid,
+  Tooltip, ResponsiveContainer, Legend
+} = Recharts;
+
+// ============================================================
+// DATA PROCESSING
+// ============================================================
+
+function parseBangleCSV(text, filename) {
+  const lines = text.trim().split("\n");
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(",");
+    if (cols[0] === "ts" || cols.length < 13) continue;
+    const ts = parseInt(cols[0]);
+    if (isNaN(ts)) continue;
+    rows.push({
+      ts, date: new Date(cols[1].replace("Z", "")),
+      ax: parseFloat(cols[2]), ay: parseFloat(cols[3]), az: parseFloat(cols[4]),
+      adiff: parseFloat(cols[5]), amag: parseFloat(cols[6]),
+      steps: parseInt(cols[7]), bpm: parseInt(cols[8]), hrconf: parseInt(cols[9]),
+      temp: parseFloat(cols[10]), press: parseFloat(cols[11]), alt: parseFloat(cols[12]),
+    });
+  }
+  const match = filename.match(/sllog_(\d{4}-\d{2}-\d{2})/);
+  return { rows, fileDate: match ? match[1] : null, filename };
+}
+
+function parseActivityCSV(text, filename) {
+  const lines = text.trim().split("\n");
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(",");
+    if (cols[0] === "ts" || cols.length < 9) continue;
+    const ts = parseInt(cols[0]);
+    if (isNaN(ts)) continue;
+    rows.push({
+      ts, date: new Date(cols[1].replace("Z", "")),
+      ax: parseFloat(cols[2]), ay: parseFloat(cols[3]), az: parseFloat(cols[4]),
+      adiff: parseFloat(cols[5]), amag: parseFloat(cols[6]),
+      bpm: parseInt(cols[7]), hrconf: parseInt(cols[8]),
+    });
+  }
+  // Extract date and time from filename like act_2026-05-01_0830.csv
+  const match = filename.match(/act_(\d{4}-\d{2}-\d{2})_(\d{4})/);
+  const fileDate = match ? match[1] : null;
+  const fileTime = match ? match[2] : null;
+  const fileId = match ? match[1] + "_" + match[2] : filename;
+
+  // Compute summary stats
+  const goodHR = rows.filter(r => r.hrconf > 50 && r.bpm > 0);
+  const hrValues = goodHR.map(r => r.bpm);
+  const summary = {
+    startTime: rows.length > 0 ? rows[0].date : null,
+    endTime: rows.length > 0 ? rows[rows.length - 1].date : null,
+    durationMin: rows.length > 1 ? Math.round((rows[rows.length - 1].ts - rows[0].ts) / 60) : 0,
+    avgHR: hrValues.length ? Math.round(mean(hrValues)) : null,
+    maxHR: hrValues.length ? Math.max(...hrValues) : null,
+    samples: rows.length,
+  };
+
+  return { rows, fileDate, fileTime, fileId, filename, summary };
+}
+
+function parseCSV(text) {
+  const lines = text.trim().split("\n");
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(",").map(h => h.trim());
+  return lines.slice(1).map(line => {
+    const cols = line.split(",");
+    const row = {};
+    headers.forEach((h, i) => { row[h] = cols[i]?.trim() || ""; });
+    return row;
+  });
+}
+
+// Simple ZIP parser using native DecompressionStream API
+async function parseZipFile(file) {
+  const buffer = await file.arrayBuffer();
+  const view = new DataView(buffer);
+  const files = [];
+  let offset = 0;
+
+  while (offset < buffer.byteLength - 4) {
+    const sig = view.getUint32(offset, true);
+    if (sig !== 0x04034b50) break; // local file header signature
+
+    const compressionMethod = view.getUint16(offset + 8, true);
+    const compressedSize = view.getUint32(offset + 18, true);
+    const uncompressedSize = view.getUint32(offset + 22, true);
+    const nameLength = view.getUint16(offset + 26, true);
+    const extraLength = view.getUint16(offset + 28, true);
+    const nameBytes = new Uint8Array(buffer, offset + 30, nameLength);
+    const name = new TextDecoder().decode(nameBytes);
+    const dataOffset = offset + 30 + nameLength + extraLength;
+    const compressedData = new Uint8Array(buffer, dataOffset, compressedSize);
+
+    if (name.endsWith(".csv") && !name.startsWith("__MACOSX")) {
+      let text;
+      if (compressionMethod === 0) {
+        // Stored (no compression)
+        text = new TextDecoder().decode(compressedData);
+      } else if (compressionMethod === 8) {
+        // Deflated — use DecompressionStream
+        try {
+          const ds = new DecompressionStream("raw");
+          const writer = ds.writable.getWriter();
+          writer.write(compressedData);
+          writer.close();
+          const reader = ds.readable.getReader();
+          const chunks = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+          }
+          const totalLength = chunks.reduce((a, c) => a + c.length, 0);
+          const merged = new Uint8Array(totalLength);
+          let pos = 0;
+          for (const chunk of chunks) {
+            merged.set(chunk, pos);
+            pos += chunk.length;
+          }
+          text = new TextDecoder().decode(merged);
+        } catch (e) {
+          console.error("Decompression failed for", name, e);
+          text = "";
+        }
+      }
+      if (text) files.push({ name: name.split("/").pop(), text });
+    }
+
+    offset = dataOffset + compressedSize;
+  }
+  return files;
+}
+
+function median(arr) {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+function quantile(arr, q) {
+  const s = [...arr].sort((a, b) => a - b);
+  const pos = (s.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  return s[base + 1] !== undefined ? s[base] + rest * (s[base + 1] - s[base]) : s[base];
+}
+
+function mean(arr) {
+  return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
+}
+
+function pairNights(bangleFiles, sleeps, physio) {
+  // Build a lookup of all Bangle rows by file date
+  const bangleByDate = {};
+  for (const bf of bangleFiles) {
+    if (bf.fileDate && bf.rows.length > 0) {
+      bangleByDate[bf.fileDate] = bf.rows;
+    }
+  }
+
+  const pairs = [];
+  const seen = new Set();
+
+  for (const ws of sleeps) {
+    if (!ws["Sleep onset"] || !ws["Wake onset"]) continue;
+    const onsetDateStr = ws["Sleep onset"].split(" ")[0]; // e.g. "2026-04-24"
+    if (seen.has(onsetDateStr)) continue;
+    seen.add(onsetDateStr);
+
+    const wp = physio.find(p => p["Sleep onset"]?.startsWith(onsetDateStr));
+
+    // Both Bangle and Whoop are in local time (BST)
+    // Parse without timezone so JS treats as local
+    const sleepOnset = new Date(ws["Sleep onset"].replace(" ", "T"));
+    const wakeOnset = new Date(ws["Wake onset"].replace(" ", "T"));
+
+    // Sleep spans two calendar days — need rows from both the evening file and morning file
+    // Evening file = same date as sleep onset, Morning file = next day
+    const nextDate = new Date(sleepOnset);
+    nextDate.setUTCDate(nextDate.getUTCDate() + 1);
+    const nextDateStr = nextDate.toISOString().split("T")[0];
+
+    const eveningRows = bangleByDate[onsetDateStr] || [];
+    const morningRows = bangleByDate[nextDateStr] || [];
+    const allRows = [...eveningRows, ...morningRows];
+
+    const sleepRows = allRows.filter(r => r.date >= sleepOnset && r.date <= wakeOnset);
+    if (sleepRows.length < 5) continue;
+
+    const goodHR = sleepRows.filter(r => r.hrconf > 50 && r.bpm > 0);
+    const hrValues = goodHR.map(r => r.bpm);
+    const tempValues = sleepRows.map(r => r.temp);
+    const moveValues = sleepRows.map(r => r.adiff);
+
+    pairs.push({
+      night: onsetDateStr,
+      bangle: {
+        sleepRows, goodHR,
+        medianHR: hrValues.length ? median(hrValues) : null,
+        minHR: hrValues.length ? Math.min(...hrValues) : null,
+        meanTemp: mean(tempValues),
+        meanMove: mean(moveValues),
+        goodHRPct: Math.round((goodHR.length / sleepRows.length) * 100),
+      },
+      whoop: {
+        sleepOnset: ws["Sleep onset"], wakeOnset: ws["Wake onset"],
+        totalMin: parseInt(ws["Asleep duration (min)"]) || 0,
+        deepMin: parseInt(ws["Deep (SWS) duration (min)"]) || 0,
+        lightMin: parseInt(ws["Light sleep duration (min)"]) || 0,
+        remMin: parseInt(ws["REM duration (min)"]) || 0,
+        awakeMin: parseInt(ws["Awake duration (min)"]) || 0,
+        efficiency: parseInt(ws["Sleep efficiency %"]) || 0,
+        restingHR: wp ? parseFloat(wp["Resting heart rate (bpm)"]) : null,
+        skinTemp: wp ? parseFloat(wp["Skin temp (celsius)"]) : null,
+        hrv: wp ? parseFloat(wp["Heart rate variability (ms)"]) : null,
+      },
+    });
+  }
+  return pairs.sort((a, b) => a.night.localeCompare(b.night));
+}
+
+function buildModel(pairs) {
+  if (!pairs.length) return null;
+  const hrOffsets = pairs.filter(p => p.bangle.medianHR && p.whoop.restingHR)
+    .map(p => p.whoop.restingHR - p.bangle.medianHR);
+  const tempOffsets = pairs.filter(p => p.bangle.meanTemp && p.whoop.skinTemp && !isNaN(p.whoop.skinTemp))
+    .map(p => p.whoop.skinTemp - p.bangle.meanTemp);
+  const allMoves = pairs.flatMap(p => p.bangle.sleepRows.map(r => r.adiff));
+  const allHR = pairs.flatMap(p => p.bangle.goodHR.map(r => r.bpm));
+  const allTemps = pairs.flatMap(p => p.bangle.sleepRows.map(r => r.temp));
+
+  // Optimise thresholds against Whoop ground truth
+  // Try different percentile combinations and score against Whoop durations
+  let bestScore = Infinity;
+  let bestParams = null;
+
+  // Search space: deep HR percentile, wake move percentile, temp percentile
+  const deepPcts = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50];
+  const movePcts = [0.85, 0.90, 0.93, 0.95, 0.97];
+  const tempPcts = [0.40, 0.50, 0.60, 0.70, 0.80];
+
+  for (const dp of deepPcts) {
+    for (const mp of movePcts) {
+      for (const tp of tempPcts) {
+        const candidateModel = {
+          hr: {
+            deep: allHR.length ? quantile(allHR, dp) : 48,
+            resting: allHR.length ? median(allHR) : 52,
+            light: allHR.length ? quantile(allHR, 0.75) : 56,
+            wake: (allHR.length ? quantile(allHR, 0.75) : 56) + 15,
+          },
+          move: {
+            asleep: allMoves.length ? median(allMoves) : 0.03,
+            restless: allMoves.length ? quantile(allMoves, 0.75) : 0.05,
+            wake: allMoves.length ? quantile(allMoves, mp) : 0.08,
+          },
+          temp: {
+            deep: allTemps.length ? quantile(allTemps, tp) : 34,
+          },
+        };
+
+        // Score this candidate across all paired nights
+        let totalError = 0;
+        for (const pair of pairs) {
+          const det = detectSleepInternal(pair.bangle.sleepRows, candidateModel);
+          if (!det) continue;
+          // Whoop combines light + REM, we compare against that
+          const whoopDeep = pair.whoop.deepMin;
+          const whoopLight = pair.whoop.lightMin + pair.whoop.remMin;
+          const whoopAwake = pair.whoop.awakeMin;
+          const errDeep = Math.abs(det.mins.deep - whoopDeep);
+          const errLight = Math.abs(det.mins.light - whoopLight);
+          const errAwake = Math.abs(det.mins.awake - whoopAwake);
+          totalError += errDeep + errLight + errAwake;
+        }
+
+        if (totalError < bestScore) {
+          bestScore = totalError;
+          bestParams = { dp, mp, tp };
+        }
+      }
+    }
+  }
+
+  // Build final model with best params
+  const bp = bestParams || { dp: 0.35, mp: 0.95, tp: 0.60 };
+
+  return {
+    hrOffset: hrOffsets.length ? mean(hrOffsets) : 0,
+    hrOffsetRange: hrOffsets.length ? [Math.min(...hrOffsets), Math.max(...hrOffsets)] : [0, 0],
+    tempOffset: tempOffsets.length ? mean(tempOffsets) : 0,
+    tempOffsetRange: tempOffsets.length ? [Math.min(...tempOffsets), Math.max(...tempOffsets)] : [0, 0],
+    move: {
+      asleep: allMoves.length ? median(allMoves) : 0.03,
+      restless: allMoves.length ? quantile(allMoves, 0.75) : 0.05,
+      wake: allMoves.length ? quantile(allMoves, bp.mp) : 0.08,
+    },
+    hr: {
+      deep: allHR.length ? quantile(allHR, bp.dp) : 48,
+      resting: allHR.length ? median(allHR) : 52,
+      light: allHR.length ? quantile(allHR, 0.75) : 56,
+      wake: (allHR.length ? quantile(allHR, 0.75) : 56) + 15,
+    },
+    temp: {
+      deep: allTemps.length ? quantile(allTemps, bp.tp) : 34,
+    },
+    nightsUsed: pairs.length,
+    optimisation: {
+      deepHRPct: bp.dp,
+      wakeMovePct: bp.mp,
+      tempPct: bp.tp,
+      avgErrorMin: pairs.length > 0 ? Math.round(bestScore / pairs.length) : 0,
+    },
+  };
+}
+
+// Internal detection used by optimiser — no smoothing, fast
+function detectSleepInternal(rows, model) {
+  if (!model || rows.length < 10) return null;
+  const mins = { deep: 0, light: 0, awake: 0, unknown: 0 };
+  for (let i = 0; i < rows.length; i += 5) {
+    const chunk = rows.slice(i, i + 5);
+    const goodHR = chunk.filter(r => r.hrconf > 50 && r.bpm > 0);
+    const avgMove = mean(chunk.map(r => r.adiff));
+    const avgHR = goodHR.length ? mean(goodHR.map(r => r.bpm)) : null;
+    const avgTemp = mean(chunk.map(r => r.temp));
+
+    let stage = "unknown";
+    if (avgHR !== null) {
+      if (avgMove > model.move.wake || avgHR > model.hr.wake) {
+        stage = "awake";
+      } else if (avgHR <= model.hr.deep && avgMove <= model.move.asleep && avgTemp >= (model.temp?.deep || 0)) {
+        stage = "deep";
+      } else {
+        stage = "light";
+      }
+    }
+    mins[stage] += 5;
+  }
+  return { mins };
+}
+
+function pairActivities(activityFiles, workouts) {
+  const pairs = [];
+  for (const af of activityFiles) {
+    if (!af.summary.startTime) continue;
+    let bestMatch = null;
+    let bestOverlap = 0;
+    for (const w of workouts) {
+      if (!w["Workout start time"] || !w["Workout end time"]) continue;
+      const wStart = new Date(w["Workout start time"].replace(" ", "T"));
+      const wEnd = new Date(w["Workout end time"].replace(" ", "T"));
+      const bStart = af.summary.startTime;
+      const bEnd = af.summary.endTime;
+      const overlapStart = Math.max(bStart.getTime(), wStart.getTime());
+      const overlapEnd = Math.min(bEnd.getTime(), wEnd.getTime());
+      const overlap = overlapEnd - overlapStart;
+      if (overlap > bestOverlap) { bestOverlap = overlap; bestMatch = w; }
+    }
+    pairs.push({
+      id: af.fileId,
+      bangle: { ...af.summary, rows: af.rows },
+      whoop: bestMatch ? {
+        startTime: bestMatch["Workout start time"],
+        endTime: bestMatch["Workout end time"],
+        durationMin: parseInt(bestMatch["Duration (min)"]) || 0,
+        activity: bestMatch["Activity name"] || "Unknown",
+        strain: parseFloat(bestMatch["Activity Strain"]) || 0,
+        calories: parseFloat(bestMatch["Energy burned (cal)"]) || 0,
+        maxHR: parseInt(bestMatch["Max HR (bpm)"]) || null,
+        avgHR: parseInt(bestMatch["Average HR (bpm)"]) || null,
+      } : null,
+      matched: !!bestMatch,
+    });
+  }
+  return pairs.sort((a, b) => (b.bangle.startTime?.getTime() || 0) - (a.bangle.startTime?.getTime() || 0));
+}
+
+function detectSleep(rows, model) {
+  if (!model || rows.length < 10) return null;
+  const wins = [];
+  for (let i = 0; i < rows.length; i += 5) {
+    const chunk = rows.slice(i, i + 5);
+    const goodHR = chunk.filter(r => r.hrconf > 50 && r.bpm > 0);
+    const avgMove = mean(chunk.map(r => r.adiff));
+    const avgHR = goodHR.length ? mean(goodHR.map(r => r.bpm)) : null;
+    const avgTemp = mean(chunk.map(r => r.temp));
+    const localTime = new Date(chunk[0].date.getTime());
+    const label = localTime.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+
+    let stage = "unknown";
+    if (avgHR !== null) {
+      if (avgMove > model.move.wake || avgHR > model.hr.wake) {
+        stage = "awake";
+      } else if (avgHR <= model.hr.deep && avgMove <= model.move.asleep && avgTemp >= (model.temp?.deep || 0)) {
+        stage = "deep";
+      } else {
+        stage = "light";
+      }
+    }
+    wins.push({ label, stage, avgHR, avgMove, avgTemp });
+  }
+  // Smooth single-sample stage changes
+  for (let i = 1; i < wins.length - 1; i++) {
+    if (wins[i].stage !== wins[i - 1].stage && wins[i].stage !== wins[i + 1].stage) {
+      wins[i].stage = wins[i - 1].stage;
+    }
+  }
+  const mins = { deep: 0, light: 0, awake: 0, unknown: 0 };
+  wins.forEach(w => { mins[w.stage] = (mins[w.stage] || 0) + 5; });
+  return { wins, mins };
+}
+
+// ============================================================
+// STYLE CONSTANTS
+// ============================================================
+
+const BG = "#0c0c10";
+const CARD = "rgba(255,255,255,0.03)";
+const BORDER = "rgba(255,255,255,0.06)";
+const TEXT = "#d4d4d8";
+const TEXT2 = "#71717a";
+const TEXT3 = "#52525b";
+const PURPLE = "#534AB7";
+const PURPLE_L = "#AFA9EC";
+const GREEN = "#1D9E75";
+const ORANGE = "#D85A30";
+const BLUE_D = "#185FA5";
+const BLUE_L = "#85B7EB";
+const RED = "#E24B4A";
+const GREY = "#888780";
+
+const FONT = "'DM Sans', system-ui, sans-serif";
+const MONO = "'JetBrains Mono', 'SF Mono', monospace";
+
+const stageColor = { deep: BLUE_D, light: BLUE_L, awake: RED, unknown: GREY };
+
+// ============================================================
+// APP
+// ============================================================
+
+function App() {
+  const [bangleFiles, setBangleFiles] = useState([]);
+  const [activityFiles, setActivityFiles] = useState([]);
+  const [sleeps, setSleeps] = useState([]);
+  const [physio, setPhysio] = useState([]);
+  const [workouts, setWorkouts] = useState([]);
+  const [pairs, setPairs] = useState([]);
+  const [actPairs, setActPairs] = useState([]);
+  const [model, setModel] = useState(null);
+  const [selectedNight, setSelectedNight] = useState(null);
+  const [selectedActivity, setSelectedActivity] = useState(null);
+  const [tab, setTab] = useState("overview");
+  const [loading, setLoading] = useState(false);
+  const [storageReady, setStorageReady] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
+
+  // Load fonts
+  useEffect(() => {
+    const link = document.createElement("link");
+    link.href = "https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500&family=JetBrains+Mono:wght@400&display=swap";
+    link.rel = "stylesheet";
+    document.head.appendChild(link);
+  }, []);
+
+  // --- PERSISTENT STORAGE ---
+  // Store raw CSV text keyed by date so we can reload and reparse
+
+  // Load saved data on startup
+  useEffect(() => {
+    async function loadStored() {
+      setLoading(true);
+      setStatusMsg("Loading saved data...");
+      try {
+        // Load Bangle files
+        const bangleIndex = await window.storage.get("bangle-index");
+        if (bangleIndex) {
+          const dates = JSON.parse(bangleIndex.value);
+          const loaded = [];
+          for (const date of dates) {
+            try {
+              const stored = await window.storage.get("bangle:" + date);
+              if (stored) {
+                loaded.push(parseBangleCSV(stored.value, "sllog_" + date + ".csv"));
+              }
+            } catch (e) { /* key missing, skip */ }
+          }
+          if (loaded.length > 0) setBangleFiles(loaded);
+        }
+
+        // Load Whoop data
+        try {
+          const storedSleeps = await window.storage.get("whoop-sleeps");
+          if (storedSleeps) setSleeps(parseCSV(storedSleeps.value));
+        } catch (e) {}
+
+        try {
+          const storedPhysio = await window.storage.get("whoop-physio");
+          if (storedPhysio) setPhysio(parseCSV(storedPhysio.value));
+        } catch (e) {}
+
+        try {
+          const storedWorkouts = await window.storage.get("whoop-workouts");
+          if (storedWorkouts) setWorkouts(parseCSV(storedWorkouts.value));
+        } catch (e) {}
+
+        // Load activity files
+        try {
+          const actIndex = await window.storage.get("act-index");
+          if (actIndex) {
+            const ids = JSON.parse(actIndex.value);
+            const loaded = [];
+            for (const id of ids) {
+              try {
+                const stored = await window.storage.get("act:" + id);
+                if (stored) loaded.push(parseActivityCSV(stored.value, "act_" + id + ".csv"));
+              } catch (e) {}
+            }
+            if (loaded.length > 0) setActivityFiles(loaded);
+          }
+        } catch (e) {}
+
+        setStatusMsg("");
+      } catch (e) {
+        console.error("Storage load error:", e);
+        setStatusMsg("");
+      }
+      setLoading(false);
+      setStorageReady(true);
+    }
+    loadStored();
+  }, []);
+
+  // Save Bangle files to storage whenever they change
+  useEffect(() => {
+    if (!storageReady || bangleFiles.length === 0) return;
+    async function save() {
+      try {
+        const dates = bangleFiles.map(f => f.fileDate).filter(Boolean);
+        await window.storage.set("bangle-index", JSON.stringify(dates));
+        for (const bf of bangleFiles) {
+          if (!bf.fileDate) continue;
+          // Reconstruct CSV text from rows
+          const header = "ts,date,ax,ay,az,adiff,amag,steps,bpm,hrconf,temp,press,alt";
+          const lines = bf.rows.map(r =>
+            [r.ts, r.date.toISOString(), r.ax, r.ay, r.az, r.adiff, r.amag, r.steps, r.bpm, r.hrconf, r.temp, r.press, r.alt].join(",")
+          );
+          await window.storage.set("bangle:" + bf.fileDate, [header, ...lines].join("\n"));
+        }
+      } catch (e) {
+        console.error("Storage save error:", e);
+      }
+    }
+    save();
+  }, [bangleFiles, storageReady]);
+
+  // Save Whoop data whenever it changes
+  useEffect(() => {
+    if (!storageReady) return;
+    async function save() {
+      try {
+        if (sleeps.length > 0) {
+          const headers = Object.keys(sleeps[0]).join(",");
+          const lines = sleeps.map(r => Object.values(r).join(","));
+          await window.storage.set("whoop-sleeps", [headers, ...lines].join("\n"));
+        }
+        if (physio.length > 0) {
+          const headers = Object.keys(physio[0]).join(",");
+          const lines = physio.map(r => Object.values(r).join(","));
+          await window.storage.set("whoop-physio", [headers, ...lines].join("\n"));
+        }
+      } catch (e) {
+        console.error("Storage save error:", e);
+      }
+    }
+    save();
+  }, [sleeps, physio, storageReady]);
+
+  // Save activity files
+  useEffect(() => {
+    if (!storageReady || activityFiles.length === 0) return;
+    async function save() {
+      try {
+        const ids = activityFiles.map(f => f.fileId).filter(Boolean);
+        await window.storage.set("act-index", JSON.stringify(ids));
+        for (const af of activityFiles) {
+          if (!af.fileId) continue;
+          const header = "ts,date,ax,ay,az,adiff,amag,bpm,hrconf";
+          const lines = af.rows.map(r =>
+            [r.ts, r.date.toISOString(), r.ax, r.ay, r.az, r.adiff, r.amag, r.bpm, r.hrconf].join(",")
+          );
+          await window.storage.set("act:" + af.fileId, [header, ...lines].join("\n"));
+        }
+      } catch (e) { console.error("Activity save error:", e); }
+    }
+    save();
+  }, [activityFiles, storageReady]);
+
+  // Save workouts
+  useEffect(() => {
+    if (!storageReady || workouts.length === 0) return;
+    async function save() {
+      try {
+        const headers = Object.keys(workouts[0]).join(",");
+        const lines = workouts.map(r => Object.values(r).join(","));
+        await window.storage.set("whoop-workouts", [headers, ...lines].join("\n"));
+      } catch (e) { console.error("Workout save error:", e); }
+    }
+    save();
+  }, [workouts, storageReady]);
+
+  const handleBangle = useCallback((e) => {
+    const files = Array.from(e.target.files);
+    Promise.all(files.map(f => new Promise(res => {
+      const r = new FileReader();
+      r.onload = () => res({ name: f.name, text: r.result });
+      r.readAsText(f);
+    }))).then(results => {
+      const newSleep = [];
+      const newAct = [];
+      for (const r of results) {
+        if (r.name.startsWith("act_") || r.name.includes("act_")) {
+          newAct.push(parseActivityCSV(r.text, r.name));
+        } else {
+          newSleep.push(parseBangleCSV(r.text, r.name));
+        }
+      }
+      if (newSleep.length > 0) {
+        setBangleFiles(prev => {
+          const existing = new Set(prev.map(f => f.fileDate));
+          const filtered = newSleep.filter(f => f.fileDate && !existing.has(f.fileDate));
+          if (filtered.length > 0) {
+            setStatusMsg(`Added ${filtered.length} sleep file(s)`);
+            setTimeout(() => setStatusMsg(""), 3000);
+          }
+          return [...prev, ...filtered];
+        });
+      }
+      if (newAct.length > 0) {
+        setActivityFiles(prev => {
+          const existing = new Set(prev.map(f => f.fileId));
+          const filtered = newAct.filter(f => f.fileId && !existing.has(f.fileId));
+          if (filtered.length > 0) {
+            setStatusMsg(`Added ${filtered.length} activity file(s)`);
+            setTimeout(() => setStatusMsg(""), 3000);
+          }
+          return [...prev, ...filtered];
+        });
+      }
+    });
+  }, []);
+
+  const handleWhoop = useCallback((e) => {
+    const files = Array.from(e.target.files);
+    files.forEach(file => {
+      const r = new FileReader();
+      r.onload = () => {
+        const text = r.result;
+        const name = file.name.toLowerCase();
+        if (name.includes("sleep")) {
+          setSleeps(parseCSV(text));
+          setStatusMsg("Whoop sleep data updated");
+        } else if (name.includes("physio")) {
+          setPhysio(parseCSV(text));
+          setStatusMsg("Whoop physio data updated");
+        } else if (name.includes("workout")) {
+          setWorkouts(parseCSV(text));
+          setStatusMsg("Whoop workout data updated");
+        }
+        setTimeout(() => setStatusMsg(""), 3000);
+      };
+      r.readAsText(file);
+    });
+  }, []);
+
+  const handleClearStorage = useCallback(async () => {
+    if (!confirm("Clear all saved data? You'll need to re-upload everything.")) return;
+    try {
+      const bKeys = await window.storage.list("bangle:");
+      if (bKeys) for (const k of bKeys.keys) await window.storage.delete(k);
+      const aKeys = await window.storage.list("act:");
+      if (aKeys) for (const k of aKeys.keys) await window.storage.delete(k);
+      await window.storage.delete("bangle-index");
+      await window.storage.delete("act-index");
+      await window.storage.delete("whoop-sleeps");
+      await window.storage.delete("whoop-physio");
+      await window.storage.delete("whoop-workouts");
+    } catch (e) {}
+    setBangleFiles([]);
+    setActivityFiles([]);
+    setSleeps([]);
+    setPhysio([]);
+    setWorkouts([]);
+    setPairs([]);
+    setActPairs([]);
+    setModel(null);
+    setSelectedNight(null);
+    setSelectedActivity(null);
+    setStatusMsg("Data cleared");
+    setTimeout(() => setStatusMsg(""), 3000);
+  }, []);
+
+  // Pair and build model whenever data changes
+  useEffect(() => {
+    if (bangleFiles.length > 0 && sleeps.length > 0) {
+      const p = pairNights(bangleFiles, sleeps, physio);
+      setPairs(p);
+      setModel(buildModel(p));
+      if (p.length > 0 && !selectedNight) setSelectedNight(p[p.length - 1].night);
+    }
+    if (activityFiles.length > 0) {
+      const ap = pairActivities(activityFiles, workouts);
+      setActPairs(ap);
+      if (ap.length > 0 && !selectedActivity) setSelectedActivity(ap[0].id);
+    }
+  }, [bangleFiles, sleeps, physio, activityFiles, workouts]);
+
+  const selPair = pairs.find(p => p.night === selectedNight);
+
+  // Build chart data for selected night
+  const nightChartData = selPair ? (() => {
+    const rows = selPair.bangle.sleepRows;
+    const points = [];
+    for (let i = 0; i < rows.length; i += 5) {
+      const chunk = rows.slice(i, i + 5);
+      const goodHR = chunk.filter(r => r.hrconf > 50 && r.bpm > 0);
+      const local = new Date(chunk[0].date.getTime());
+      points.push({
+        time: local.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }),
+        hr: goodHR.length ? Math.round(mean(goodHR.map(r => r.bpm))) : null,
+        move: Math.round(mean(chunk.map(r => r.adiff)) * 1000),
+        temp: Math.round(mean(chunk.map(r => r.temp)) * 10) / 10,
+      });
+    }
+    return points;
+  })() : [];
+
+  // Build detection data
+  const detection = selPair && model ? detectSleep(selPair.bangle.sleepRows, model) : null;
+  const detectionData = detection ? detection.wins.map(w => ({
+    time: w.label,
+    value: w.stage === "deep" ? 1 : w.stage === "light" ? 2 : w.stage === "awake" ? 3 : 0,
+    stage: w.stage,
+    fill: stageColor[w.stage],
+  })) : [];
+
+  // HR comparison data
+  const hrCompData = pairs.map(p => ({
+    night: p.night.slice(5),
+    bangle: p.bangle.medianHR,
+    whoop: p.whoop.restingHR,
+  }));
+
+  // Sleep stages data
+  const stageData = pairs.map(p => ({
+    night: p.night.slice(5),
+    deep: p.whoop.deepMin,
+    light: p.whoop.lightMin,
+    rem: p.whoop.remMin,
+    awake: p.whoop.awakeMin,
+  }));
+
+  const Stat = ({ label, value, unit, sub }) => (
+    <div style={{ background: CARD, borderRadius: "10px", padding: "14px 16px", border: `1px solid ${BORDER}` }}>
+      <div style={{ fontSize: "11px", color: TEXT2, marginBottom: "6px", textTransform: "uppercase", letterSpacing: "0.04em", fontFamily: FONT }}>{label}</div>
+      <div style={{ fontFamily: MONO, fontSize: "22px", fontWeight: 500 }}>
+        {value}<span style={{ fontSize: "12px", fontWeight: 400, color: TEXT2, marginLeft: "4px" }}>{unit}</span>
+      </div>
+      {sub && <div style={{ fontSize: "11px", color: TEXT3, marginTop: "4px", fontFamily: FONT }}>{sub}</div>}
+    </div>
+  );
+
+  const TabBtn = ({ id, label }) => (
+    <button onClick={() => setTab(id)} style={{
+      background: "none", border: "none", color: tab === id ? TEXT : TEXT3,
+      padding: "10px 16px", fontSize: "13px", cursor: "pointer", fontFamily: FONT, fontWeight: 500,
+      borderBottom: tab === id ? `2px solid ${PURPLE}` : "2px solid transparent",
+    }}>{label}</button>
+  );
+
+  const ChartLegend = ({ items }) => (
+    <div style={{ display: "flex", gap: "14px", marginTop: "6px", fontSize: "11px", color: TEXT3, flexWrap: "wrap" }}>
+      {items.map(([color, label], i) => (
+        <span key={i} style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+          <span style={{ width: "8px", height: "8px", borderRadius: "2px", background: color, display: "inline-block" }} />
+          {label}
+        </span>
+      ))}
+    </div>
+  );
+
+  return (
+    <div style={{ minHeight: "100vh", background: BG, color: TEXT, fontFamily: FONT, padding: 0 }}>
+      {/* Header */}
+      <div style={{ borderBottom: `1px solid ${BORDER}`, padding: "20px 24px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", background: model ? GREEN : GREY }} />
+          <h1 style={{ fontSize: "16px", fontWeight: 500, margin: 0, letterSpacing: "-0.02em" }}>Sleep calibration</h1>
+        </div>
+        {model && <span style={{ fontSize: "12px", color: TEXT2, fontFamily: MONO }}>{model.nightsUsed} nights</span>}
+      </div>
+
+      <div style={{ padding: "20px 24px", maxWidth: "720px", margin: "0 auto" }}>
+        {/* Upload */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "12px", marginBottom: "24px" }}>
+          <label style={{
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+            gap: "8px", padding: "20px 16px", border: `1px dashed rgba(255,255,255,0.12)`,
+            borderRadius: "10px", cursor: "pointer", background: CARD, fontSize: "13px",
+          }}>
+            <span style={{ fontSize: "11px", color: TEXT2, textTransform: "uppercase", letterSpacing: "0.05em" }}>Bangle CSVs</span>
+            <span style={{ fontFamily: MONO, fontSize: "20px", fontWeight: 500 }}>{bangleFiles.length + activityFiles.length || "—"}</span>
+            <span style={{ fontSize: "10px", color: TEXT3 }}>{bangleFiles.length} sleep · {activityFiles.length} activity</span>
+            <input type="file" accept=".csv" multiple onChange={handleBangle} style={{ display: "none" }} />
+          </label>
+          <label style={{
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+            gap: "8px", padding: "20px 16px", border: `1px dashed rgba(255,255,255,0.12)`,
+            borderRadius: "10px", cursor: "pointer", background: CARD, fontSize: "13px",
+          }}>
+            <span style={{ fontSize: "11px", color: TEXT2, textTransform: "uppercase", letterSpacing: "0.05em" }}>Whoop CSVs</span>
+            <span style={{ fontFamily: MONO, fontSize: "20px", fontWeight: 500 }}>{sleeps.length > 0 ? "✓" : "—"}</span>
+            <span style={{ fontSize: "10px", color: TEXT3 }}>sleeps + physiological_cycles + workouts</span>
+            <input type="file" accept=".csv" multiple onChange={handleWhoop} style={{ display: "none" }} />
+          </label>
+        </div>
+
+        {/* Status message */}
+        {statusMsg && (
+          <div style={{ fontSize: "12px", color: GREEN, textAlign: "center", marginBottom: "12px", fontFamily: MONO }}>
+            {statusMsg}
+          </div>
+        )}
+
+        {/* Clear data */}
+        {(bangleFiles.length > 0 || sleeps.length > 0) && (
+          <div style={{ textAlign: "right", marginBottom: "16px" }}>
+            <button onClick={handleClearStorage} style={{
+              background: "none", border: "none", color: TEXT3, fontSize: "11px",
+              cursor: "pointer", fontFamily: FONT, textDecoration: "underline",
+            }}>Clear all saved data</button>
+          </div>
+        )}
+
+        {loading && <div style={{ textAlign: "center", padding: "40px", color: TEXT2 }}>Loading...</div>}
+
+        {(pairs.length > 0 || actPairs.length > 0) && (
+          <>
+            {/* Tabs */}
+            <div style={{ display: "flex", gap: 0, marginBottom: "24px", borderBottom: `1px solid ${BORDER}` }}>
+              {pairs.length > 0 && <TabBtn id="overview" label="Overview" />}
+              {pairs.length > 0 && <TabBtn id="nights" label="Nights" />}
+              {actPairs.length > 0 && <TabBtn id="activity" label="Activity" />}
+              {model && <TabBtn id="model" label="Model" />}
+            </div>
+
+            {/* OVERVIEW */}
+            {tab === "overview" && (
+              <div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "12px", marginBottom: "24px" }}>
+                  <Stat label="HR offset" value={`+${model.hrOffset.toFixed(1)}`} unit="bpm" sub={`range ${model.hrOffsetRange[0].toFixed(0)} to ${model.hrOffsetRange[1].toFixed(0)}`} />
+                  <Stat label="Temp offset" value={`+${model.tempOffset.toFixed(1)}`} unit="°C" sub={`range ${model.tempOffsetRange[0].toFixed(1)} to ${model.tempOffsetRange[1].toFixed(1)}`} />
+                  <Stat label="HR confidence" value={`${Math.round(mean(pairs.map(p => p.bangle.goodHRPct)))}`} unit="%" sub="overnight avg" />
+                  <Stat label="Paired nights" value={`${pairs.length}`} unit="" sub={`of ${bangleFiles.length} files`} />
+                </div>
+
+                <div style={{ fontSize: "12px", color: TEXT2, marginBottom: "8px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Heart rate comparison</div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <BarChart data={hrCompData} barGap={2}>
+                    <CartesianGrid stroke="rgba(128,128,128,0.1)" strokeDasharray="3 3" />
+                    <XAxis dataKey="night" tick={{ fontSize: 10, fill: TEXT2 }} />
+                    <YAxis domain={[40, 65]} tick={{ fontSize: 10, fill: TEXT2 }} />
+                    <Tooltip contentStyle={{ background: "#1a1a2e", border: "none", fontSize: 12 }} />
+                    <Bar dataKey="bangle" fill={PURPLE} radius={[3, 3, 0, 0]} name="Bangle" />
+                    <Bar dataKey="whoop" fill={PURPLE_L} radius={[3, 3, 0, 0]} name="Whoop" />
+                  </BarChart>
+                </ResponsiveContainer>
+                <ChartLegend items={[[PURPLE, "Bangle median"], [PURPLE_L, "Whoop resting"]]} />
+
+                <div style={{ fontSize: "12px", color: TEXT2, marginBottom: "8px", marginTop: "24px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Whoop sleep stages</div>
+                <ResponsiveContainer width="100%" height={180}>
+                  <BarChart data={stageData}>
+                    <CartesianGrid stroke="rgba(128,128,128,0.1)" strokeDasharray="3 3" />
+                    <XAxis dataKey="night" tick={{ fontSize: 10, fill: TEXT2 }} />
+                    <YAxis tick={{ fontSize: 10, fill: TEXT2 }} />
+                    <Tooltip contentStyle={{ background: "#1a1a2e", border: "none", fontSize: 12 }} />
+                    <Bar dataKey="deep" stackId="a" fill={BLUE_D} name="Deep" />
+                    <Bar dataKey="light" stackId="a" fill={BLUE_L} name="Light" />
+                    <Bar dataKey="rem" stackId="a" fill={GREEN} name="REM" />
+                    <Bar dataKey="awake" stackId="a" fill={GREY} name="Awake" />
+                  </BarChart>
+                </ResponsiveContainer>
+                <ChartLegend items={[[BLUE_D, "Deep"], [BLUE_L, "Light"], [GREEN, "REM"], [GREY, "Awake"]]} />
+              </div>
+            )}
+
+            {/* NIGHTS */}
+            {tab === "nights" && (
+              <div>
+                <div style={{ display: "flex", gap: "6px", marginBottom: "20px", flexWrap: "wrap" }}>
+                  {pairs.map(p => (
+                    <button key={p.night} onClick={() => setSelectedNight(p.night)} style={{
+                      background: selectedNight === p.night ? PURPLE : "rgba(255,255,255,0.05)",
+                      border: "none", color: selectedNight === p.night ? "#fff" : "#a1a1aa",
+                      padding: "6px 12px", borderRadius: "6px", fontSize: "12px",
+                      cursor: "pointer", fontFamily: MONO,
+                    }}>{p.night.slice(5)}</button>
+                  ))}
+                </div>
+
+                {selPair && (
+                  <div>
+                    <div style={{
+                      display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1px",
+                      background: BORDER, borderRadius: "10px", overflow: "hidden", marginBottom: "20px",
+                    }}>
+                      {[
+                        { l: "Bangle HR", v: selPair.bangle.medianHR, u: "bpm" },
+                        { l: "Whoop HR", v: selPair.whoop.restingHR, u: "bpm" },
+                        { l: "Bangle temp", v: selPair.bangle.meanTemp?.toFixed(1), u: "°C" },
+                        { l: "Whoop temp", v: selPair.whoop.skinTemp || "—", u: "°C" },
+                        { l: "Sleep duration", v: selPair.whoop.totalMin, u: "min" },
+                        { l: "Efficiency", v: selPair.whoop.efficiency, u: "%" },
+                      ].map((s, i) => (
+                        <div key={i} style={{ background: BG, padding: "12px 16px" }}>
+                          <div style={{ fontSize: "10px", color: TEXT3, textTransform: "uppercase", letterSpacing: "0.04em" }}>{s.l}</div>
+                          <div style={{ fontFamily: MONO, fontSize: "18px", fontWeight: 500, marginTop: "4px" }}>
+                            {s.v}<span style={{ fontSize: "11px", color: TEXT3, marginLeft: "3px" }}>{s.u}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    <div style={{ fontSize: "12px", color: TEXT2, marginBottom: "8px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Overnight HR + movement</div>
+                    <ResponsiveContainer width="100%" height={180}>
+                      <LineChart data={nightChartData}>
+                        <CartesianGrid stroke="rgba(128,128,128,0.1)" strokeDasharray="3 3" />
+                        <XAxis dataKey="time" tick={{ fontSize: 9, fill: TEXT2 }} interval="preserveStartEnd" />
+                        <YAxis yAxisId="hr" domain={[40, 110]} tick={{ fontSize: 10, fill: TEXT2 }} />
+                        <YAxis yAxisId="mv" orientation="right" domain={[0, 100]} tick={{ fontSize: 10, fill: TEXT2 }} />
+                        <Tooltip contentStyle={{ background: "#1a1a2e", border: "none", fontSize: 12 }} />
+                        <Line yAxisId="hr" dataKey="hr" stroke={PURPLE} strokeWidth={1.5} dot={false} connectNulls />
+                        <Line yAxisId="mv" dataKey="move" stroke={GREEN} strokeWidth={1} dot={false} strokeDasharray="4 3" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                    <ChartLegend items={[[PURPLE, "Heart rate"], [GREEN, "Movement"]]} />
+
+                    {detection && (
+                      <div style={{ marginTop: "20px" }}>
+                        <div style={{ fontSize: "12px", color: TEXT2, marginBottom: "8px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Bangle sleep detection</div>
+                        <div style={{ display: "flex", borderRadius: "6px", overflow: "hidden", height: "32px" }}>
+                          {detection.wins.map((w, i) => (
+                            <div key={i} style={{
+                              flex: 1, background: stageColor[w.stage],
+                              borderRight: i < detection.wins.length - 1 ? "1px solid rgba(0,0,0,0.3)" : "none",
+                            }} title={`${w.label}: ${w.stage}`} />
+                          ))}
+                        </div>
+                        <div style={{ display: "flex", justifyContent: "space-between", marginTop: "4px", fontSize: "10px", color: TEXT3, fontFamily: MONO }}>
+                          <span>{detection.wins[0]?.label}</span>
+                          <span>{detection.wins[detection.wins.length - 1]?.label}</span>
+                        </div>
+                        <div style={{ display: "flex", gap: "12px", marginTop: "8px", fontSize: "11px", color: TEXT2 }}>
+                          <span>Deep: {detection.mins.deep}m</span>
+                          <span>Light: {detection.mins.light}m</span>
+                          <span>Awake: {detection.mins.awake}m</span>
+                        </div>
+                        <div style={{ fontSize: "11px", color: TEXT3, marginTop: "4px" }}>
+                          Whoop → Deep: {selPair.whoop.deepMin}m · Light: {selPair.whoop.lightMin + selPair.whoop.remMin}m · Awake: {selPair.whoop.awakeMin}m
+                        </div>
+                        <ChartLegend items={[[BLUE_D, "Deep"], [BLUE_L, "Light"], [RED, "Awake"]]} />
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* MODEL */}
+            {tab === "model" && (
+              <div>
+                <div style={{ fontSize: "12px", color: TEXT2, marginBottom: "16px", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                  Calibration model parameters
+                </div>
+                <div style={{
+                  background: CARD, border: `1px solid ${BORDER}`, borderRadius: "10px", padding: "20px",
+                  fontFamily: MONO, fontSize: "13px", lineHeight: "2.2",
+                }}>
+                  <div style={{ color: TEXT3 }}>// Heart rate</div>
+                  <div>hr_offset: <span style={{ color: PURPLE_L }}>{model.hrOffset.toFixed(1)}</span> bpm</div>
+                  <div>deep_threshold: <span style={{ color: PURPLE_L }}>&lt;{Math.round(model.hr.deep)}</span> bpm</div>
+                  <div>resting_median: <span style={{ color: PURPLE_L }}>{Math.round(model.hr.resting)}</span> bpm</div>
+                  <div>wake_threshold: <span style={{ color: PURPLE_L }}>&gt;{Math.round(model.hr.wake)}</span> bpm</div>
+                  <div style={{ height: "8px" }} />
+                  <div style={{ color: TEXT3 }}>// Temperature</div>
+                  <div>temp_offset: <span style={{ color: ORANGE }}>+{model.tempOffset.toFixed(2)}</span> °C</div>
+                  <div>deep_temp_min: <span style={{ color: ORANGE }}>{model.temp?.deep?.toFixed(1) || "—"}</span> °C</div>
+                  <div style={{ height: "8px" }} />
+                  <div style={{ color: TEXT3 }}>// Movement (adiff)</div>
+                  <div>asleep_threshold: <span style={{ color: GREEN }}>{model.move.asleep.toFixed(4)}</span></div>
+                  <div>restless_threshold: <span style={{ color: GREEN }}>{model.move.restless.toFixed(4)}</span></div>
+                  <div>wake_threshold: <span style={{ color: GREEN }}>{model.move.wake.toFixed(4)}</span></div>
+                  <div style={{ height: "8px" }} />
+                  <div style={{ color: TEXT3 }}>// Optimisation</div>
+                  <div>deep_hr_percentile: <span style={{ color: PURPLE_L }}>{(model.optimisation?.deepHRPct * 100 || 25).toFixed(0)}</span>%</div>
+                  <div>wake_move_percentile: <span style={{ color: PURPLE_L }}>{(model.optimisation?.wakeMovePct * 100 || 95).toFixed(0)}</span>%</div>
+                  <div>temp_percentile: <span style={{ color: PURPLE_L }}>{(model.optimisation?.tempPct * 100 || 60).toFixed(0)}</span>%</div>
+                  <div>avg_error_per_night: <span style={{ color: model.optimisation?.avgErrorMin < 60 ? GREEN : ORANGE }}>{model.optimisation?.avgErrorMin || "—"}</span> min</div>
+                  <div style={{ height: "8px" }} />
+                  <div style={{ color: TEXT3 }}>// Meta</div>
+                  <div>nights_trained: <span style={{ color: TEXT }}>{model.nightsUsed}</span></div>
+                  <div>last_updated: <span style={{ color: TEXT3 }}>{new Date().toISOString().split("T")[0]}</span></div>
+                </div>
+
+                <div style={{
+                  marginTop: "20px", padding: "16px", background: "rgba(83,74,183,0.06)",
+                  borderRadius: "10px", border: "1px solid rgba(83,74,183,0.15)",
+                  fontSize: "13px", lineHeight: "1.6", color: "#a1a1aa",
+                }}>
+                  Calibrated to your body from {model.nightsUsed} paired nights. Upload more data weekly to tighten the model.
+                  These values will transfer directly into your Bangle sleep scoring engine.
+                </div>
+              </div>
+            )}
+
+            {/* ACTIVITY */}
+            {tab === "activity" && (
+              <div>
+                {/* Activity selector */}
+                <div style={{ display: "flex", gap: "6px", marginBottom: "20px", flexWrap: "wrap" }}>
+                  {actPairs.map(a => (
+                    <button key={a.id} onClick={() => setSelectedActivity(a.id)} style={{
+                      background: selectedActivity === a.id ? RED : "rgba(255,255,255,0.05)",
+                      border: "none", color: selectedActivity === a.id ? "#fff" : "#a1a1aa",
+                      padding: "6px 12px", borderRadius: "6px", fontSize: "12px",
+                      cursor: "pointer", fontFamily: MONO,
+                    }}>
+                      {a.id.slice(5)}
+                      {a.whoop && <span style={{ marginLeft: "6px", opacity: 0.6 }}>{a.whoop.activity}</span>}
+                    </button>
+                  ))}
+                </div>
+
+                {(() => {
+                  const selAct = actPairs.find(a => a.id === selectedActivity);
+                  if (!selAct) return null;
+
+                  // Build HR chart data from activity rows
+                  const actChartData = [];
+                  const rows = selAct.bangle.rows || [];
+                  for (let i = 0; i < rows.length; i += 3) {
+                    const chunk = rows.slice(i, i + 3);
+                    const goodHR = chunk.filter(r => r.hrconf > 50 && r.bpm > 0);
+                    const time = chunk[0].date;
+                    actChartData.push({
+                      time: time.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+                      hr: goodHR.length ? Math.round(mean(goodHR.map(r => r.bpm))) : null,
+                      move: Math.round(mean(chunk.map(r => r.adiff)) * 1000),
+                    });
+                  }
+
+                  return (
+                    <div>
+                      {/* Comparison stats */}
+                      <div style={{
+                        display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1px",
+                        background: BORDER, borderRadius: "10px", overflow: "hidden", marginBottom: "20px",
+                      }}>
+                        {[
+                          { l: "Bangle duration", v: selAct.bangle.durationMin, u: "min" },
+                          { l: "Whoop duration", v: selAct.whoop ? selAct.whoop.durationMin : "—", u: selAct.whoop ? "min" : "" },
+                          { l: "Bangle avg HR", v: selAct.bangle.avgHR || "—", u: selAct.bangle.avgHR ? "bpm" : "" },
+                          { l: "Whoop avg HR", v: selAct.whoop ? selAct.whoop.avgHR : "—", u: selAct.whoop ? "bpm" : "" },
+                          { l: "Bangle max HR", v: selAct.bangle.maxHR || "—", u: selAct.bangle.maxHR ? "bpm" : "" },
+                          { l: "Whoop max HR", v: selAct.whoop ? selAct.whoop.maxHR : "—", u: selAct.whoop ? "bpm" : "" },
+                        ].map((s, i) => (
+                          <div key={i} style={{ background: BG, padding: "12px 16px" }}>
+                            <div style={{ fontSize: "10px", color: TEXT3, textTransform: "uppercase", letterSpacing: "0.04em" }}>{s.l}</div>
+                            <div style={{ fontFamily: MONO, fontSize: "18px", fontWeight: 500, marginTop: "4px" }}>
+                              {s.v}<span style={{ fontSize: "11px", color: TEXT3, marginLeft: "3px" }}>{s.u}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {selAct.whoop && (
+                        <div style={{
+                          display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1px",
+                          background: BORDER, borderRadius: "10px", overflow: "hidden", marginBottom: "20px",
+                        }}>
+                          {[
+                            { l: "Activity type", v: selAct.whoop.activity, u: "" },
+                            { l: "Strain", v: selAct.whoop.strain, u: "" },
+                            { l: "Calories", v: selAct.whoop.calories, u: "cal" },
+                            { l: "Matched", v: "✓", u: "" },
+                          ].map((s, i) => (
+                            <div key={i} style={{ background: BG, padding: "12px 16px" }}>
+                              <div style={{ fontSize: "10px", color: TEXT3, textTransform: "uppercase", letterSpacing: "0.04em" }}>{s.l}</div>
+                              <div style={{ fontFamily: MONO, fontSize: "18px", fontWeight: 500, marginTop: "4px" }}>
+                                {s.v}<span style={{ fontSize: "11px", color: TEXT3, marginLeft: "3px" }}>{s.u}</span>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {!selAct.whoop && (
+                        <div style={{ fontSize: "12px", color: TEXT3, marginBottom: "16px", padding: "12px", background: CARD, borderRadius: "8px" }}>
+                          No matching Whoop workout found for this activity.
+                        </div>
+                      )}
+
+                      {/* Activity HR chart */}
+                      <div style={{ fontSize: "12px", color: TEXT2, marginBottom: "8px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Activity HR + movement</div>
+                      <ResponsiveContainer width="100%" height={200}>
+                        <LineChart data={actChartData}>
+                          <CartesianGrid stroke="rgba(128,128,128,0.1)" strokeDasharray="3 3" />
+                          <XAxis dataKey="time" tick={{ fontSize: 9, fill: TEXT2 }} interval="preserveStartEnd" />
+                          <YAxis yAxisId="hr" domain={[40, 180]} tick={{ fontSize: 10, fill: TEXT2 }} />
+                          <YAxis yAxisId="mv" orientation="right" domain={[0, 300]} tick={{ fontSize: 10, fill: TEXT2 }} />
+                          <Tooltip contentStyle={{ background: "#1a1a2e", border: "none", fontSize: 12 }} />
+                          <Line yAxisId="hr" dataKey="hr" stroke={RED} strokeWidth={1.5} dot={false} connectNulls />
+                          <Line yAxisId="mv" dataKey="move" stroke={GREEN} strokeWidth={1} dot={false} strokeDasharray="4 3" />
+                        </LineChart>
+                      </ResponsiveContainer>
+                      <ChartLegend items={[[RED, "Heart rate"], [GREEN, "Movement"]]} />
+                    </div>
+                  );
+                })()}
+              </div>
+            )}
+
+          </>
+        )}
+
+        {/* Empty state */}
+        {pairs.length === 0 && !loading && (
+          <div style={{ textAlign: "center", padding: "60px 20px", color: TEXT3, fontSize: "14px", lineHeight: "1.8" }}>
+            Upload your Bangle CSV files and Whoop export zip to start calibration.
+            <br />The dashboard will automatically pair matching nights and build your personal sleep model.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+</body>
+</html>
