@@ -8,36 +8,35 @@
 </head>
 <body>
   <div id="root"></div>
-  <script src="https://unpkg.com/react/umd/react.production.min.js"></script>
-  <script src="https://unpkg.com/react-dom/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/react-is/umd/react-is.production.min.js"></script>
-  <script src="https://unpkg.com/recharts/umd/Recharts.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
-  <script type="text/babel">
-    // localStorage shim matching window.storage API
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/react-is@18.2.0/umd/react-is.production.min.js"></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.23.9/babel.min.js"></script>
+  <script>
     window.storage = {
-      async get(key) {
-        const val = localStorage.getItem("sc:" + key);
-        if (val === null) throw new Error("Key not found");
-        return { key, value: val };
+      get: function(key) {
+        var val = localStorage.getItem("sc:" + key);
+        if (val === null) return Promise.reject(new Error("Key not found"));
+        return Promise.resolve({ key: key, value: val });
       },
-      async set(key, value) {
+      set: function(key, value) {
         localStorage.setItem("sc:" + key, value);
-        return { key, value };
+        return Promise.resolve({ key: key, value: value });
       },
-      async delete(key) {
+      delete: function(key) {
         localStorage.removeItem("sc:" + key);
-        return { key, deleted: true };
+        return Promise.resolve({ key: key, deleted: true });
       },
-      async list(prefix) {
-        const keys = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (k.startsWith("sc:" + (prefix || ""))) {
+      list: function(prefix) {
+        var keys = [];
+        for (var i = 0; i < localStorage.length; i++) {
+          var k = localStorage.key(i);
+          if (k.indexOf("sc:" + (prefix || "")) === 0) {
             keys.push(k.slice(3));
           }
         }
-        return { keys };
+        return Promise.resolve({ keys: keys });
       }
     };
   </script>
